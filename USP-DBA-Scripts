@@ -1,0 +1,677 @@
+create proc GrowthEvents
+as
+
+DECLARE @current_tracefilename VARCHAR(500);
+DECLARE @0_tracefilename VARCHAR(500);
+DECLARE @indx INT;
+SELECT @current_tracefilename = path
+FROM sys.traces
+WHERE is_default = 1;
+SET @current_tracefilename = REVERSE(@current_tracefilename);
+SELECT @indx = PATINDEX('%\%', @current_tracefilename);
+SET @current_tracefilename = REVERSE(@current_tracefilename);
+SET @0_tracefilename = LEFT(@current_tracefilename, LEN(@current_tracefilename) - @indx) + '\log.trc';
+SELECT DatabaseName, 
+       te.name, 
+       Filename, 
+       CONVERT(DECIMAL(10, 3), Duration / 1000000e0) AS TimeTakenSeconds, 
+       StartTime, 
+       EndTime, 
+       (IntegerData * 8.0 / 1024) AS 'ChangeInSize MB', 
+       ApplicationName, 
+       HostName, 
+       LoginName
+FROM ::fn_trace_gettable(@0_tracefilename, DEFAULT) t
+     INNER JOIN sys.trace_events AS te ON t.EventClass = te.trace_event_id
+WHERE(trace_event_id >= 92
+      AND trace_event_id <= 95)
+--	  and DatabaseName= 'FactorAI_IDEA_EPIM'
+ORDER BY t.StartTime;
+
+go
+create proc [dbo].[DBStatus]
+as
+-- Check DB state
+SELECT name, state_desc FROM sys.databases-- WHERE name = 'FactorAI_IDEA_EPIM';
+GO
+
+
+create Proc sp_who3
+as
+SELECT
+SPID,ER.percent_complete,
+CAST(((DATEDIFF(s,start_time,GetDate()))/3600) as varchar) + ' hour(s), '
++ CAST((DATEDIFF(s,start_time,GetDate())%3600)/60 as varchar) + 'min, '
++ CAST((DATEDIFF(s,start_time,GetDate())%60) as varchar) + ' sec' as running_time,
+CAST((estimated_completion_time/3600000) as varchar) + ' hour(s), '
++ CAST((estimated_completion_time %3600000)/60000 as varchar) + 'min, '
++ CAST((estimated_completion_time %60000)/1000 as varchar) + ' sec' as est_time_to_go,
+DATEADD(second,estimated_completion_time/1000, getdate()) as est_completion_time,
+ER.command,ER.blocking_session_id, SP.DBID,LASTWAITTYPE,
+DB_NAME(SP.DBID) AS DBNAME,
+SUBSTRING(est.text, (ER.statement_start_offset/2)+1,
+((CASE ER.statement_end_offset
+WHEN -1 THEN DATALENGTH(est.text)
+ELSE ER.statement_end_offset
+END - ER.statement_start_offset)/2) + 1) AS QueryText,
+TEXT,CPU,HOSTNAME,LOGIN_TIME,LOGINAME,
+SP.status,PROGRAM_NAME,NT_DOMAIN, NT_USERNAME
+FROM SYSPROCESSES SP
+INNER JOIN
+sys.dm_exec_requests ER
+ON sp.spid = ER.session_id
+CROSS APPLY SYS.DM_EXEC_SQL_TEXT(er.sql_handle) EST
+go
+create proc BackupAudit
+as
+SELECT  
+    bs.database_name AS [DatabaseName],
+    CASE bs.type  
+        WHEN 'D' THEN 'Full Backup'
+        WHEN 'I' THEN 'Differential Backup'
+        WHEN 'L' THEN 'Transaction Log Backup'
+        WHEN 'F' THEN 'File or Filegroup Backup'
+        WHEN 'G' THEN 'Differential File Backup'
+        WHEN 'P' THEN 'Partial Backup'
+        WHEN 'Q' THEN 'Differential Partial Backup'
+        ELSE 'Other'
+    END AS [BackupType],
+    bmf.physical_device_name AS [BackupPath],
+    bs.backup_start_date AS [StartTime],
+    bs.backup_finish_date AS [FinishTime],
+    DATEDIFF(MINUTE, bs.backup_start_date, bs.backup_finish_date) AS [Duration_Minutes],
+    CAST(bs.backup_size / 1024 / 1024 AS DECIMAL(10,2)) AS [BackupSize_MB],
+    CAST(bs.compressed_backup_size / 1024 / 1024 AS DECIMAL(10,2)) AS [CompressedSize_MB],
+    bs.recovery_model AS [RecoveryModel],
+    bs.is_copy_only AS [IsCopyOnly],
+    CASE bs.is_damaged WHEN 1 THEN 'Damaged' ELSE 'OK' END AS [BackupIntegrity],
+    CASE bset.is_password_protected WHEN 1 THEN 'Yes' ELSE 'No' END AS [PasswordProtected],
+    bs.server_name AS [ServerName],
+    bs.user_name AS [InitiatedBy],
+    bs.machine_name AS [MachineName]
+FROM  
+    msdb.dbo.backupset bs  
+INNER JOIN  
+    msdb.dbo.backupmediafamily bmf  
+    ON bs.media_set_id = bmf.media_set_id
+LEFT JOIN 
+    msdb.dbo.backupset bset
+    ON bs.backup_set_id = bset.backup_set_id
+WHERE  
+    bs.backup_start_date > DATEADD(DAY, -7, GETDATE())  -- last 7 days (change as needed)
+ORDER BY  
+    bs.database_name,  
+    bs.backup_finish_date DESC;
+
+    GO
+
+create proc BackupLastDate
+as
+SELECT
+    db.name AS [DatabaseName],
+    MAX(bs.backup_finish_date) AS [LastBackupDate],
+    CASE bs.type
+        WHEN 'D' THEN 'Full'
+        WHEN 'I' THEN 'Differential'
+        WHEN 'L' THEN 'Log'
+    END AS [BackupType]
+FROM
+    master.sys.databases db
+LEFT JOIN
+    msdb.dbo.backupset bs
+    ON bs.database_name = db.name
+GROUP BY
+    db.name, bs.type
+ORDER BY
+    db.name;
+    go
+
+create proc BackupRestoreStatus
+as
+SELECT  
+    r.session_id,
+    r.command,
+    db.name AS [DatabaseName],
+    r.status,
+    CONVERT(NUMERIC(6,2), r.percent_complete) AS [PercentComplete],
+    CONVERT(VARCHAR(20), 
+            DATEADD(SECOND, r.estimated_completion_time / 1000, GETDATE()), 
+            120) AS [EstimatedCompletionTime],
+    CONVERT(NUMERIC(10,2), r.estimated_completion_time / 1000.0 / 60.0) AS [ETA_Minutes],
+    r.start_time AS [StartTime],
+    DATEDIFF(MINUTE, r.start_time, GETDATE()) AS [Elapsed_Minutes],
+    r.total_elapsed_time / 1000 AS [Elapsed_Seconds],
+    r.wait_type,
+    r.wait_time / 1000 AS [Wait_Sec],
+    r.last_wait_type,
+    r.cpu_time / 1000 AS [CPU_Sec],
+    r.blocking_session_id,
+    r.command AS [CommandType],
+    t.text AS [TSQLCommand]
+FROM  
+    sys.dm_exec_requests r
+INNER JOIN  
+    sys.databases db ON r.database_id = db.database_id
+CROSS APPLY  
+    sys.dm_exec_sql_text(r.sql_handle) t
+WHERE  
+    r.command IN ('BACKUP DATABASE', 'BACKUP LOG', 'RESTORE DATABASE', 'RESTORE LOG')
+ORDER BY  
+    r.percent_complete DESC;
+
+go
+create proc FragReport
+as
+CREATE TABLE #INDEXFRAGINFO
+(
+DatabaseName nvarchar(128),
+DatabaseID smallint,
+full_obj_name nvarchar(384),
+index_id INT, 
+[name] nvarchar(128), 
+index_type_desc nvarchar(60), 
+index_depth tinyint,
+index_level tinyint,
+[AVG Fragmentation] float, 
+fragment_count bigint,
+[Rank] bigint 
+)
+
+DECLARE @command VARCHAR(1000) 
+SELECT @command = 'Use [' + '?' + '] select ' + '''' + '?' + '''' + ' AS DatabaseName,
+DB_ID() AS DatabaseID,
+QUOTENAME(DB_NAME(i.database_id), '+ '''' + '"' + '''' +')+ N'+ '''' + '.' + '''' +'+ QUOTENAME(OBJECT_SCHEMA_NAME(i.object_id, i.database_id), '+ '''' + '"' + '''' +')+ N'+ '''' + '.' + '''' +'+ QUOTENAME(OBJECT_NAME(i.object_id, i.database_id), '+ '''' + '"' + '''' +') as full_obj_name, 
+i.index_id,
+o.name, 
+i.index_type_desc, 
+i.index_depth,
+i.index_level,
+i.avg_fragmentation_in_percent as [AVG Fragmentation], 
+i.fragment_count, 
+i.rnk as Rank
+from (
+select *, DENSE_RANK() OVER(PARTITION by database_id ORDER BY avg_fragmentation_in_percent DESC) as rnk
+from sys.dm_db_index_physical_stats(DB_ID(), default, default, default,'+ '''' + 'limited' + '''' +')
+where avg_fragmentation_in_percent >30 AND 
+INDEX_ID > 0 AND 
+Page_Count > 1000
+) as i
+join sys.indexes o on o.object_id = i.object_id and o.index_id = i.index_id
+where i.rnk <= 25
+order by i.database_id, i.rnk;'
+
+INSERT #INDEXFRAGINFO EXEC sp_MSForEachDB @command 
+
+SELECT * FROM #INDEXFRAGINFO
+Where DatabaseID > 4
+order by [RANK];
+
+DROP TABLE #INDEXFRAGINFO
+
+GO
+Create proc CheckDBAudit
+as
+SET NOCOUNT ON
+CREATE TABLE #DBInfo_LastKnownGoodCheckDB
+(
+ParentObject varchar(1000) NULL,
+Object varchar(1000) NULL,
+Field varchar(1000) NULL,
+Value varchar(1000) NULL,
+DatabaseName varchar(1000) NULL
+
+)
+
+DECLARE csrDatabases CURSOR FAST_FORWARD LOCAL FOR
+SELECT name FROM sys.databases WHERE name NOT IN ('tempdb')
+
+OPEN csrDatabases
+
+DECLARE 
+@DatabaseName varchar(1000),
+@SQL varchar(8000)
+
+FETCH NEXT FROM csrDatabases INTO @DatabaseName
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+
+--Create dynamic SQL to be inserted into temp table
+SET @SQL = 'DBCC DBINFO (' + CHAR(39) + @DatabaseName + CHAR(39) + ') WITH TABLERESULTS'
+
+--Insert the results of the DBCC DBINFO command into the temp table
+INSERT INTO #DBInfo_LastKnownGoodCheckDB
+(ParentObject, Object, Field, Value) EXEC(@SQL)
+
+--Set the database name where it has yet to be set
+UPDATE #DBInfo_LastKnownGoodCheckDB
+SET DatabaseName = @DatabaseName
+WHERE DatabaseName IS NULL
+
+FETCH NEXT FROM csrDatabases INTO @DatabaseName
+END
+
+--Get rid of the rows that I don't care about
+DELETE FROM #DBInfo_LastKnownGoodCheckDB
+WHERE Field <> 'dbi_dbccLastKnownGood'
+
+SELECT 
+DatabaseName, 
+CAST(Value AS datetime) AS LastGoodCheckDB,
+DATEDIFF(dd, CAST(Value AS datetime), GetDate()) AS DaysSinceGoodCheckDB,
+DATEDIFF(hh, CAST(Value AS datetime), GetDate()) AS HoursSinceGoodCheckDB
+FROM #DBInfo_LastKnownGoodCheckDB
+ORDER BY DatabaseName
+
+DROP TABLE #DBInfo_LastKnownGoodCheckDB
+
+GO
+
+create proc BlockAudit
+as
+SELECT [Session ID] = s.session_id,   
+       [User Process] = CONVERT(CHAR(1), s.is_user_process),   
+       [Login] = s.login_name,   
+       [Blocked By] = ISNULL(CONVERT (varchar, w.blocking_session_id), ''),   
+         [Head Blocker]  =  
+    CASE  
+        WHEN r2.session_id IS NOT NULL AND (r.blocking_session_id = 0 OR r.session_id IS NULL) THEN '1'  
+        ELSE ''  
+    END,  
+                        [DatabaseName] = ISNULL(db_name(r.database_id), N''),   
+                        [Task State] = ISNULL(t.task_state, N''),   
+                        [Command] = ISNULL(r.command, N''),   
+                        [statement_text] = Substring(st.TEXT, (r.statement_start_offset / 2) + 1,   
+                                            ( ( CASE r.statement_end_offset WHEN - 1 THEN Datalength(st.TEXT)  
+                                            ELSE r.statement_end_offset   
+                                            END - r.statement_start_offset ) / 2 ) + 1), ----It will display the statement which is being executed presently.  
+  
+ [command_text] =Coalesce(Quotename(Db_name(st.dbid)) + N'.' + Quotename(Object_schema_name(st.objectid, st.dbid)) + N'.' + Quotename(Object_name(st.objectid, st.dbid)), ''), -- It will display the Stored Procedure's Name.  
+  
+ [Total CPU (ms)] = r.cpu_time,  
+ r.total_elapsed_time / (1000.0) 'Elapsed Time (in Sec)',  
+                                 [Wait Time (ms)] = ISNULL(w.wait_duration_ms, 0),  
+                                 [Wait Type] = ISNULL(w.wait_type, N''),  
+                                 [Wait Resource] = ISNULL(w.resource_description, N''),  
+                                 [Total Physical I/O (MB)] = (s.reads + s.writes) * 8 / 1024,  
+                                 [Memory Use (KB)] = s.memory_usage * 8192 / 1024,   
+  
+ [Host Name] = ISNULL(s.host_name, N''),  
+ [Net Address] = ISNULL(c.client_net_address, N''),   
+ [Workload Group] = N'',  
+                     [Application] = ISNULL(s.program_name, N'')  
+FROM sys.dm_exec_sessions s  
+LEFT OUTER JOIN sys.dm_exec_connections c ON (s.session_id = c.session_id)  
+LEFT OUTER JOIN sys.dm_exec_requests r ON (s.session_id = r.session_id)  
+LEFT OUTER JOIN sys.dm_os_tasks t ON (r.session_id = t.session_id  
+                                      AND r.request_id = t.request_id)  
+LEFT OUTER JOIN  
+  (  
+ SELECT *,   
+        ROW_NUMBER() OVER (PARTITION BY waiting_task_address  
+                           ORDER BY wait_duration_ms DESC) AS row_num   
+   FROM sys.dm_os_waiting_tasks ) w ON (t.session_id = w.session_id)  
+AND w.row_num = 1   
+LEFT OUTER JOIN sys.dm_exec_requests r2 ON (r.session_id = r2.blocking_session_id) OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) AS st   
+  
+WHERE s.session_Id > 50   
+  
+ORDER BY s.session_id
+
+GO
+
+create proc DBSizeAudit
+as
+CREATE TABLE #databases
+(
+ DATABASE_NAME VARCHAR(50),
+ DATABASE_SIZE FLOAT,
+ REMARKS VARCHAR(100)
+)
+ 
+INSERT #Databases EXEC ('EXEC sp_databases');
+ 
+SELECT @@SERVERNAME AS SERVER_NAME,
+       DATABASE_NAME,
+       SYSMFM.source_file_name_main,
+       SYSMFM.physical_name_main,
+       SYSMFL.source_file_name_log,
+       SYSMFL.physical_name_log,
+       DATABASE_SIZE AS '(KB)',
+       ROUND(DATABASE_SIZE / 1024, 2) AS '(MB)',
+       ROUND((DATABASE_SIZE / 1024) / 1024, 2) AS '(GB)',
+       ROUND(((DATABASE_SIZE / 1024) / 1024)/1024, 2) AS '(TB)',
+       SYSDB.compatibility_level,
+       SYSDB.create_date,
+       SYSDB.database_id,
+       SYSDB.collation_name,
+       SYSDB.recovery_model,
+       SYSDB.recovery_model_desc,
+       SYSDB.user_access,
+       SYSDB.user_access_desc,
+       SYSDB.state,
+       SYSDB.state_desc
+  FROM #databases AS DB
+       INNER JOIN sys.databases AS SYSDB ON DB.DATABASE_NAME = SYSDB.name
+       INNER JOIN (SELECT database_id,
+                          name AS source_file_name_main,
+                          physical_name AS physical_name_main 
+                     FROM sys.master_files AS SYSMF
+                    WHERE SYSMF.file_id = 1) AS SYSMFM ON SYSMFM.database_id = SYSDB.database_id
+       INNER JOIN (SELECT database_id,
+                          name AS source_file_name_log,
+                          physical_name AS physical_name_log 
+                     FROM sys.master_files AS SYSMF
+                    WHERE SYSMF.file_id = 2) AS SYSMFL ON SYSMFL.database_id = SYSDB.database_id
+ WHERE SYSDB.database_id > 4
+ ORDER BY DATABASE_SIZE desc;
+ 
+DROP TABLE #databases;
+
+--TSQL Script to get DB Size's in SQL Server 2005 above
+
+SELECT d.NAME
+    ,ROUND(SUM(mf.size) * 8 / 1024, 0) Size_MBs
+    ,(SUM(mf.size) * 8 / 1024) / 1024 AS Size_GBs
+FROM sys.master_files mf
+INNER JOIN sys.databases d ON d.database_id = mf.database_id
+WHERE d.database_id > 4 -- Skip system databases
+GROUP BY d.NAME
+ORDER BY d.NAME
+
+go
+
+USE master;
+GO
+
+IF OBJECT_ID('dbo.usp_ShrinkDatabaseInChunks','P') IS NOT NULL
+    DROP PROCEDURE dbo.usp_ShrinkDatabaseInChunks;
+GO
+
+CREATE PROCEDURE dbo.usp_ShrinkDatabaseInChunks
+(
+    @DatabaseName SYSNAME,
+    @FileName SYSNAME = NULL,
+    @TargetSizeMB INT = NULL,
+    @MinPercentFree INT = NULL,
+    @IntervalMB INT = 300,
+    @DelayBetweenShrinks VARCHAR(12) = '00:00:02',
+    @WhatIf BIT = 0
+)
+AS
+BEGIN
+    SET NOCOUNT, XACT_ABORT, ARITHABORT ON;
+
+    DECLARE @CurrSizeMB INT,
+            @SpaceUsedMB INT,
+            @NewSizeMB INT,
+            @ShrinkStart DATETIME = GETDATE(),
+            @ShrinkEnd DATETIME,
+            @Status VARCHAR(20) = 'Pending',
+            @Message NVARCHAR(2000) = '',
+            @DBCCCommand NVARCHAR(MAX),
+            @FileInfoSQL NVARCHAR(MAX);
+
+    BEGIN TRY
+        IF @DatabaseName IS NULL
+            THROW 50000, 'Database name is required.', 1;
+
+        IF @TargetSizeMB IS NULL AND @MinPercentFree IS NULL
+            THROW 50001, 'Specify either @TargetSizeMB or @MinPercentFree.', 1;
+
+        -- Get current file info dynamically
+        SET @FileInfoSQL = N'
+        USE ' + QUOTENAME(@DatabaseName) + ';
+        SELECT TOP 1
+            name AS FileName,
+            size / 128 AS CurrSizeMB,
+            CAST(FILEPROPERTY(name,''SpaceUsed'') AS INT)/128 AS SpaceUsedMB,
+            CASE type WHEN 0 THEN ''DATA'' WHEN 1 THEN ''LOG'' ELSE ''OTHER'' END AS FileType
+        FROM sys.database_files
+        WHERE (@FileName IS NULL OR name=@FileName)
+        ORDER BY size DESC;
+        ';
+
+        -- Use sp_executesql with OUTPUT parameters
+        DECLARE @FileNameOut SYSNAME, @FileTypeOut VARCHAR(10);
+
+        EXEC sp_executesql @FileInfoSQL,
+            N'@FileName SYSNAME, @FileNameOut SYSNAME OUTPUT, @CurrSizeMBOut INT OUTPUT, @SpaceUsedMBOut INT OUTPUT, @FileTypeOut VARCHAR(10) OUTPUT',
+            @FileName=@FileName,
+            @FileNameOut=@FileNameOut OUTPUT,
+            @CurrSizeMBOut=@CurrSizeMB OUTPUT,
+            @SpaceUsedMBOut=@SpaceUsedMB OUTPUT,
+            @FileTypeOut=@FileTypeOut OUTPUT;
+
+        -- Determine target size
+        IF @TargetSizeMB IS NULL
+            SET @TargetSizeMB = CEILING(@SpaceUsedMB / (CAST(@MinPercentFree AS FLOAT)/100.0));
+
+        IF @CurrSizeMB <= @TargetSizeMB
+        BEGIN
+            SET @Status='Skipped';
+            SET @Message='Shrink not required.';
+            GOTO LogAndExit;
+        END
+
+        -- Shrink loop
+        WHILE @CurrSizeMB > @TargetSizeMB
+        BEGIN
+            SET @NewSizeMB = @CurrSizeMB - @IntervalMB;
+            IF @NewSizeMB < @TargetSizeMB SET @NewSizeMB=@TargetSizeMB;
+
+            SET @DBCCCommand = N'USE ' + QUOTENAME(@DatabaseName) + ';
+                                DBCC SHRINKFILE (' + QUOTENAME(@FileName,'''') + ',' + CAST(@NewSizeMB AS NVARCHAR(10)) + ') WITH NO_INFOMSGS;';
+
+            PRINT 'Shrinking from ' + CAST(@CurrSizeMB AS VARCHAR(10)) + ' MB → ' + CAST(@NewSizeMB AS VARCHAR(10)) + ' MB';
+
+            IF @WhatIf = 0
+                EXEC sp_executesql @DBCCCommand;
+            ELSE
+                PRINT '(WhatIf mode — skipped execution)';
+
+            SET @CurrSizeMB=@NewSizeMB;
+
+            IF @DelayBetweenShrinks IS NOT NULL
+                WAITFOR DELAY @DelayBetweenShrinks;
+        END
+
+        SET @Status='Success';
+        SET @Message='Shrink completed successfully.';
+
+    END TRY
+    BEGIN CATCH
+        SET @Status='Failed';
+        SET @Message=ERROR_MESSAGE();
+    END CATCH
+
+LogAndExit:
+    SET @ShrinkEnd=GETDATE();
+
+    -- Log everything dynamically to permanent table
+    SET @FileInfoSQL = N'
+    IF OBJECT_ID(''master.dbo.DBA_Shrink_Log'', ''U'') IS NULL
+    BEGIN
+        CREATE TABLE master.dbo.DBA_Shrink_Log
+        (
+            LogID INT IDENTITY(1,1) PRIMARY KEY,
+            DatabaseName SYSNAME,
+            FileName SYSNAME,
+            FileType VARCHAR(10),
+            OldSizeMB INT,
+            NewSizeMB INT,
+            DurationMin INT,
+            StartTime DATETIME,
+            EndTime DATETIME,
+            ExecutedBy SYSNAME,
+            Status VARCHAR(20),
+            Message NVARCHAR(2000),
+            CreatedOn DATETIME DEFAULT GETDATE()
+        );
+    END
+
+    INSERT INTO master.dbo.DBA_Shrink_Log
+    (DatabaseName, FileName, FileType, OldSizeMB, NewSizeMB, DurationMin, StartTime, EndTime, ExecutedBy, Status, Message)
+    VALUES
+    (''' + @DatabaseName + ''',''' + @FileName + ''',''' + ISNULL(@FileTypeOut,'OTHER') + ''',NULL,' + CAST(@CurrSizeMB AS NVARCHAR(10)) + ',' +
+    CAST(DATEDIFF(MINUTE,@ShrinkStart,@ShrinkEnd) AS NVARCHAR(10)) + ',''' + CONVERT(NVARCHAR,@ShrinkStart,120) + ''',GETDATE(),ORIGINAL_LOGIN(),''' + @Status + ''',''' + @Message + ''');
+    ';
+
+    EXEC sp_executesql @FileInfoSQL;
+
+    PRINT 'Shrink logged successfully.';
+END
+
+
+--EXEC dbo.usp_ShrinkDatabaseInChunks
+--    @DatabaseName = 'DBName',
+--    @FileName = 'DataFileName',
+--    @TargetSizeMB = xxxx;
+
+go
+
+
+create proc OrphanUsersAllDB
+as
+CREATE TABLE #OrphUsers 
+
+( 
+
+    DatabaseName NVARCHAR(50), 
+
+    OrphanedUserName NVARCHAR(100), 
+
+    UserType NVARCHAR(50), 
+
+    OrphanType NVARCHAR(50) -- 'No Login' or 'SID Mismatch' 
+
+); 
+
+  
+
+DECLARE @DBName NVARCHAR(255); 
+
+DECLARE @SQL NVARCHAR(MAX); 
+
+  
+
+DECLARE db_cursor CURSOR FOR 
+
+SELECT name  
+
+FROM sys.databases 
+
+WHERE database_id > 4 -- skip system DBs: master=1, tempdb=2, model=3, msdb=4 
+
+  AND state_desc = 'ONLINE'; -- only online databases 
+
+  
+
+OPEN db_cursor; 
+
+FETCH NEXT FROM db_cursor INTO @DBName; 
+
+  
+
+WHILE @@FETCH_STATUS = 0 
+
+BEGIN 
+
+    BEGIN TRY 
+
+        SET @SQL = N' 
+
+        -- 1. Orphan users without any corresponding login 
+
+        INSERT INTO #OrphUsers 
+
+        SELECT  
+
+            ''' + @DBName + ''' AS DatabaseName, 
+
+            dp.name AS OrphanedUserName, 
+
+            dp.type_desc AS UserType, 
+
+            ''No Login'' AS OrphanType 
+
+        FROM [' + @DBName + '].sys.database_principals dp 
+
+        LEFT JOIN sys.server_principals sp 
+
+            ON dp.name = sp.name 
+
+        WHERE sp.name IS NULL 
+
+          AND dp.type IN (''S'',''U'',''G'') 
+
+          AND dp.name NOT IN (''sys'', ''INFORMATION_SCHEMA'', ''guest''); 
+
+  
+
+        -- 2. Orphan users with corresponding login but mismatched SID 
+
+        INSERT INTO #OrphUsers 
+
+        SELECT  
+
+            ''' + @DBName + ''' AS DatabaseName, 
+
+            dp.name AS OrphanedUserName, 
+
+            dp.type_desc AS UserType, 
+
+            ''SID Mismatch'' AS OrphanType 
+
+        FROM [' + @DBName + '].sys.database_principals dp 
+
+        INNER JOIN sys.server_principals sp 
+
+            ON dp.name = sp.name 
+
+        WHERE dp.sid <> sp.sid 
+
+          AND dp.type IN (''S'',''U'',''G'') 
+
+          AND dp.name NOT IN (''sys'', ''INFORMATION_SCHEMA'', ''guest''); 
+
+        '; 
+
+  
+
+        EXEC sp_executesql @SQL; 
+
+    END TRY 
+
+    BEGIN CATCH 
+
+        PRINT 'Could not query database: ' + @DBName; 
+
+    END CATCH; 
+
+  
+
+    FETCH NEXT FROM db_cursor INTO @DBName; 
+
+END 
+
+  
+
+CLOSE db_cursor; 
+
+DEALLOCATE db_cursor; 
+
+  
+
+-- Final report 
+
+SELECT * 
+
+FROM #OrphUsers 
+
+where OrphanedUserName NOT in ('dbo') 
+
+ORDER BY DatabaseName, OrphanType, OrphanedUserName; 
+ 
+
+DROP TABLE #OrphUsers; 
